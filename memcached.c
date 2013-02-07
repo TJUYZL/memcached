@@ -13,6 +13,37 @@
  *      Anatoly Vorobey <mellon@pobox.com>
  *      Brad Fitzpatrick <brad@danga.com>
  */
+
+/*
+COPYRIGHT 2013 INTEL CORPORATION ALL RIGHTS RESERVED. THE
+SOURCE CODE, INFORMATION AND MATERIAL ("MATERIAL") CONTAINED
+HEREIN IS OWNED BY INTEL CORPORATION OR ITS SUPPLIERS OR
+LICENSORS, AND TITLE TO SUCH MATERIAL REMAINS WITH INTEL
+CORPORATION OR ITS SUPPLIERS OR LICENSORS. THE MATERIAL
+CONTAINS PROPRIETARY INFORMATION OF INTEL OR ITS SUPPLIERS
+AND LICENSORS. THE MATERIAL IS PROTECTED BY WORLDWIDE
+COPYRIGHT LAWS AND TREATY PROVISIONS. NO PART OF THE
+MATERIAL MAY BE USED, COPIED, REPRODUCED, MODIFIED,
+PUBLISHED, UPLOADED, POSTED, TRANSMITTED, DISTRIBUTED OR
+DISCLOSED IN ANY WAY WITHOUT INTEL'S PRIOR EXPRESS WRITTEN
+PERMISSION. NO LICENSE UNDER ANY PATENT, COPYRIGHT OR OTHER
+INTELLECTUAL PROPERTY RIGHTS IN THE MATERIAL IS GRANTED TO
+OR CONFERRED UPON YOU, EITHER EXPRESSLY, BY IMPLICATION,
+INDUCEMENT, ESTOPPEL OR OTHERWISE. ANY LICENSE UNDER SUCH
+INTELLECTUAL PROPERTY RIGHTS MUST BE EXPRESS AND APPROVED BY
+INTEL IN WRITING. INCLUDE ANY SUPPLIER COPYRIGHT NOTICES AS
+SUPPLIER REQUIRES INTEL TO USE. INCLUDE SUPPLIER TRADEMARKS
+OR LOGOS AS SUPPLIER REQUIRES INTEL TO USE, PRECEDED BY AN
+ASTERISK. AN ASTERISKED FOOTNOTE CAN BE ADDED AS FOLLOWS:
+*THIRD PARTY TRADEMARKS ARE THE PROPERTY OF THEIR RESPECTIVE
+OWNERS. UNLESS OTHERWISE AGREED BY INTEL IN WRITING, YOU MAY
+NOT REMOVE OR ALTER THIS NOTICE OR ANY OTHER NOTICE EMBEDDED
+IN MATERIALS BY INTEL OR INTEL.S SUPPLIERS OR LICENSORS IN
+ANY WAY.
+
+* @author      Zacharia Fadika <zfadika@gmail.com>
+*/
+
 #include "memcached.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -22,7 +53,10 @@
 #include <sys/uio.h>
 #include <ctype.h>
 #include <stdarg.h>
-
+/*Zacharia Fadika*/
+#include "affinity.h"
+#define CPU_AFFINITY
+/*Zacharia Fadika*/
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
 #ifndef _P1003_1B_VISIBLE
@@ -102,6 +136,12 @@ struct stats stats;
 struct settings settings;
 time_t process_started;     /* when the process was started */
 
+/*Zacharia Fadika*/
+#if defined(CPU_AFFINITY)
+int threadPinInc=0;
+int numProcs=0;
+#endif
+/*Zacharia Fadika*/
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
 
@@ -225,7 +265,6 @@ static void settings_init(void) {
     settings.hashpower_init = 0;
     settings.slab_reassign = false;
     settings.slab_automove = 0;
-    settings.shutdown_command = false;
 }
 
 /*
@@ -3330,15 +3369,6 @@ static void process_command(conn *c, char *command) {
 
         conn_set_state(c, conn_closing);
 
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "shutdown") == 0)) {
-
-        if (settings.shutdown_command) {
-            conn_set_state(c, conn_closing);
-            raise(SIGINT);
-        } else {
-            out_string(c, "ERROR: shutdown not enabled");
-        }
-
     } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "slabs") == 0) {
         if (ntokens == 5 && strcmp(tokens[COMMAND_TOKEN + 1].value, "reassign") == 0) {
             int src, dst, rv;
@@ -4455,7 +4485,6 @@ static void usage(void) {
     printf("-p <num>      TCP port number to listen on (default: 11211)\n"
            "-U <num>      UDP port number to listen on (default: 11211, 0 is off)\n"
            "-s <file>     UNIX socket path to listen on (disables network support)\n"
-           "-A            enable ascii \"shutdown\" command\n"
            "-a <mask>     access mask for UNIX socket, in octal (default: 0700)\n"
            "-l <addr>     interface to listen on (default: INADDR_ANY, all addresses)\n"
            "              <addr> may be specified as host:port. If you don't specify\n"
@@ -4759,7 +4788,6 @@ int main (int argc, char **argv) {
     /* process arguments */
     while (-1 != (c = getopt(argc, argv,
           "a:"  /* access mask for unix socket */
-          "A"  /* enable admin shutdown commannd */
           "p:"  /* TCP port number to listen on */
           "s:"  /* unix socket path to listen on */
           "U:"  /* UDP port number to listen on */
@@ -4777,6 +4805,11 @@ int main (int argc, char **argv) {
           "f:"  /* factor? */
           "n:"  /* minimum space allocated for key+value+flags */
           "t:"  /* threads */
+/*Zacharia Fadika*/
+#if defined(CPU_AFFINITY)
+          "T:"  /* thread pinning increment */
+#endif
+/*Zacharia Fadika*/
           "D:"  /* prefix delimiter? */
           "L"   /* Large memory pages */
           "R:"  /* max requests per event */
@@ -4788,11 +4821,6 @@ int main (int argc, char **argv) {
           "o:"  /* Extended generic options */
         ))) {
         switch (c) {
-        case 'A':
-            /* enables "shutdown" command */
-            settings.shutdown_command = true;
-            break;
-
         case 'a':
             /* access for unix domain socket, as octal mask (like chmod)*/
             settings.access= strtol(optarg,NULL,8);
@@ -4895,6 +4923,13 @@ int main (int argc, char **argv) {
                                 " your machine or less.\n");
             }
             break;
+/*Zacharia Fadika*/
+#if defined(CPU_AFFINITY)
+        case 'T':
+            threadPinInc = atoi(optarg);
+            break;
+#endif
+/*Zacharia Fadika*/
         case 'D':
             if (! optarg || ! optarg[0]) {
                 fprintf(stderr, "No delimiter specified\n");
@@ -5021,7 +5056,21 @@ int main (int argc, char **argv) {
             return 1;
         }
     }
+/*Zacharia Fadika*/
 
+#if defined(CPU_AFFINITY)
+    numProcs = sysconf(_SC_NPROCESSORS_ONLN);
+    printf ("Number of CPUs: %d\n", numProcs);
+    printf ("Number of Memcached threads: %d\n", settings.num_threads);
+
+    if (threadPinInc > 0)
+	set_affinity(settings.num_threads,numProcs,threadPinInc);
+    else
+	printf ("Memcached will not be pinned to any CPUs, check your -T parameter\n");
+
+#endif
+
+/*Zacharia Fadika*/
     /*
      * Use one workerthread to serve each UDP port if the user specified
      * multiple ports
